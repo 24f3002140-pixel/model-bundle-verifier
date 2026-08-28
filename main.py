@@ -18,9 +18,16 @@ REQUIRED_FILES = (
     "adapter_config.json",
 )
 
-UNSAFE_EXTENSIONS = (".bin", ".pt", ".pth", ".pkl", ".pickle")
+UNSAFE_EXTENSIONS = (
+    ".bin",
+    ".pt",
+    ".pth",
+    ".pkl",
+    ".pickle",
+)
 
 MAX_SAFE_INTEGER = 9007199254740991
+
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -37,19 +44,20 @@ def compact_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def is_nonempty_string(value: Any) -> bool:
+def nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and len(value) > 0
 
 
-def is_safe_integer(value: Any) -> bool:
+def safe_integer(value: Any) -> bool:
     return (
         isinstance(value, int)
         and not isinstance(value, bool)
-        and 0 < value <= MAX_SAFE_INTEGER
+        and value > 0
+        and value <= MAX_SAFE_INTEGER
     )
 
 
-def is_unit_number(value: Any) -> bool:
+def finite_unit(value: Any) -> bool:
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
@@ -58,19 +66,8 @@ def is_unit_number(value: Any) -> bool:
     )
 
 
-def unique_violation(violations, code):
+def add_violation(violations, code):
     violations.append(code)
-
-
-def reject_duplicate_keys(pairs):
-    result = {}
-
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-
-    return result
 
 
 def parse_json_file(files, filename, violations):
@@ -80,47 +77,20 @@ def parse_json_file(files, filename, violations):
     value = files[filename]
 
     if not isinstance(value, str):
-        unique_violation(
+        add_violation(
             violations,
             f"INVALID_FILE:{filename}",
         )
         return None
 
     try:
-        return json.loads(
-            value,
-            object_pairs_hook=reject_duplicate_keys,
-        )
+        return json.loads(value)
     except Exception:
-        unique_violation(
+        add_violation(
             violations,
             f"INVALID_JSON:{filename}",
         )
         return None
-
-
-def validate_policy(policy, violations):
-    if not isinstance(policy, dict):
-        unique_violation(violations, "INVALID_POLICY")
-        return
-
-    required_slices = policy.get("requiredSlices")
-
-    if not (
-        isinstance(required_slices, list)
-        and len(required_slices) > 0
-        and all(is_nonempty_string(x) for x in required_slices)
-        and len(required_slices) == len(set(required_slices))
-    ):
-        unique_violation(violations, "INVALID_POLICY")
-
-    for field in (
-        "license",
-        "intendedUse",
-        "limitations",
-    ):
-        if not is_nonempty_string(policy.get(field)):
-            unique_violation(violations, "INVALID_POLICY")
 
 
 def parse_model_card(readme):
@@ -131,13 +101,13 @@ def parse_model_card(readme):
     cursor = 0
 
     while True:
-        index = readme.find(prefix, cursor)
+        pos = readme.find(prefix, cursor)
 
-        if index == -1:
+        if pos == -1:
             break
 
-        positions.append(index)
-        cursor = index + len(prefix)
+        positions.append(pos)
+        cursor = pos + len(prefix)
 
     if len(positions) == 0:
         return "missing", None
@@ -145,26 +115,64 @@ def parse_model_card(readme):
     if len(positions) > 1:
         return "count", None
 
-    payload_start = positions[0] + len(prefix)
-    payload_end = readme.find(suffix, payload_start)
+    start = positions[0] + len(prefix)
+    end = readme.find(suffix, start)
 
-    if payload_end == -1:
+    if end == -1:
         return "invalid", None
 
-    payload = readme[payload_start:payload_end]
+    payload = readme[start:end]
 
     try:
-        card = json.loads(
-            payload,
-            object_pairs_hook=reject_duplicate_keys,
-        )
+        value = json.loads(payload)
     except Exception:
         return "invalid", None
 
-    if not isinstance(card, dict):
+    if not isinstance(value, dict):
         return "invalid", None
 
-    return "valid", card
+    return "valid", value
+
+
+def validate_policy(policy, violations):
+    if not isinstance(policy, dict):
+        add_violation(
+            violations,
+            "INVALID_POLICY",
+        )
+        return
+
+    required_slices = policy.get(
+        "requiredSlices"
+    )
+
+    if not (
+        isinstance(required_slices, list)
+        and len(required_slices) > 0
+        and all(
+            nonempty_string(x)
+            for x in required_slices
+        )
+        and len(required_slices)
+        == len(set(required_slices))
+    ):
+        add_violation(
+            violations,
+            "INVALID_POLICY",
+        )
+
+    for field in (
+        "license",
+        "intendedUse",
+        "limitations",
+    ):
+        if not nonempty_string(
+            policy.get(field)
+        ):
+            add_violation(
+                violations,
+                "INVALID_POLICY",
+            )
 
 
 @app.get("/")
@@ -175,9 +183,9 @@ def root():
 @app.post("/verify-bundle")
 async def verify_bundle(request: Request):
 
-    # ============================================================
-    # REQUEST VALIDATION
-    # ============================================================
+    # ==========================================================
+    # REQUEST
+    # ==========================================================
 
     try:
         body = await request.json()
@@ -196,7 +204,10 @@ async def verify_bundle(request: Request):
     policy = body.get("policy")
     files = body.get("files")
 
-    if not isinstance(policy, dict) or not isinstance(files, dict):
+    if (
+        not isinstance(policy, dict)
+        or not isinstance(files, dict)
+    ):
         return JSONResponse(
             status_code=400,
             content={"error": "INVALID_INPUT"},
@@ -204,52 +215,59 @@ async def verify_bundle(request: Request):
 
     violations = []
 
-    validate_policy(policy, violations)
+    validate_policy(
+        policy,
+        violations,
+    )
 
-    # ============================================================
+    # ==========================================================
     # REQUIRED FILES
-    # ============================================================
+    # ==========================================================
 
     for filename in REQUIRED_FILES:
+
         if filename not in files:
-            unique_violation(
+            add_violation(
                 violations,
                 f"MISSING_FILE:{filename}",
             )
 
-    # ============================================================
-    # FILE VALUES MUST BE UTF-8 STRINGS
-    # ============================================================
+    # ==========================================================
+    # FILE UTF-8 VALIDATION
+    # ==========================================================
 
     raw_bytes = {}
 
     for filename, value in files.items():
 
         if not isinstance(filename, str):
-            unique_violation(
+            add_violation(
                 violations,
                 "UNTRACKED_FILE",
             )
             continue
 
         if not isinstance(value, str):
-            unique_violation(
+            add_violation(
                 violations,
                 f"INVALID_FILE:{filename}",
             )
             continue
 
         try:
-            raw_bytes[filename] = value.encode("utf-8")
+            data = value.encode("utf-8")
         except UnicodeEncodeError:
-            unique_violation(
+            add_violation(
                 violations,
                 f"INVALID_FILE:{filename}",
             )
+            continue
 
-    # ============================================================
-    # EXTRA FILES + UNSAFE WEIGHTS
-    # ============================================================
+        raw_bytes[filename] = data
+
+    # ==========================================================
+    # EXTRA FILES
+    # ==========================================================
 
     required_set = set(REQUIRED_FILES)
 
@@ -259,25 +277,34 @@ async def verify_bundle(request: Request):
             continue
 
         if filename not in required_set:
-            unique_violation(
+            add_violation(
                 violations,
                 "UNTRACKED_FILE",
             )
 
-        lower_name = filename.lower()
+    # ==========================================================
+    # UNSAFE WEIGHTS
+    # ==========================================================
+
+    for filename in files:
+
+        if not isinstance(filename, str):
+            continue
+
+        lowered = filename.lower()
 
         if any(
-            lower_name.endswith(extension)
-            for extension in UNSAFE_EXTENSIONS
+            lowered.endswith(ext)
+            for ext in UNSAFE_EXTENSIONS
         ):
-            unique_violation(
+            add_violation(
                 violations,
                 "UNSAFE_WEIGHTS",
             )
 
-    # ============================================================
+    # ==========================================================
     # INVENTORY
-    # ============================================================
+    # ==========================================================
 
     inventory = parse_json_file(
         files,
@@ -285,7 +312,7 @@ async def verify_bundle(request: Request):
         violations,
     )
 
-    # Every supplied file except inventory.json.
+    # Inventory contains every supplied file except itself.
     inventory_names = [
         filename
         for filename in files
@@ -295,17 +322,17 @@ async def verify_bundle(request: Request):
         )
     ]
 
-    # UTF-8 byte ordering, NOT Unicode code-point ordering.
+    # Sort by UTF-8 bytes, not locale or Unicode code points.
     inventory_names.sort(
-        key=lambda filename: filename.encode("utf-8")
+        key=lambda name: name.encode("utf-8")
     )
 
     expected_inventory = []
 
     for filename in inventory_names:
 
-        # A non-string file value cannot have a valid UTF-8 byte
-        # representation and therefore cannot produce a valid entry.
+        # Files whose values are not valid UTF-8 strings
+        # cannot produce an inventory byte/hash entry.
         if filename not in raw_bytes:
             continue
 
@@ -319,123 +346,118 @@ async def verify_bundle(request: Request):
             }
         )
 
-    # inventoryDigest is based on the recomputed compact JSON.
+    # Exact compact JSON of the recomputed inventory.
     inventory_digest = sha256_bytes(
         compact_json(expected_inventory)
     )
 
     if isinstance(inventory, list):
 
-        inventory_valid = True
+        inventory_ok = True
 
-        # Exact number of entries.
-        if len(inventory) != len(expected_inventory):
-            inventory_valid = False
+        if len(inventory) != len(
+            expected_inventory
+        ):
+            inventory_ok = False
 
-        if inventory_valid:
+        if inventory_ok:
 
             for actual, expected in zip(
                 inventory,
                 expected_inventory,
             ):
 
-                # Every entry must be an object.
-                if not isinstance(actual, dict):
-                    inventory_valid = False
+                if not isinstance(
+                    actual,
+                    dict,
+                ):
+                    inventory_ok = False
                     break
 
-                # EXACT key order.
+                # Exact key order.
                 if list(actual.keys()) != [
                     "name",
                     "bytes",
                     "sha256",
                 ]:
-                    inventory_valid = False
-                    break
-
-                # Exact types.
-                if not isinstance(
-                    actual["name"],
-                    str,
-                ):
-                    inventory_valid = False
-                    break
-
-                if not (
-                    isinstance(actual["bytes"], int)
-                    and not isinstance(
-                        actual["bytes"],
-                        bool,
-                    )
-                    and 0 <= actual["bytes"]
-                    <= MAX_SAFE_INTEGER
-                ):
-                    inventory_valid = False
-                    break
-
-                if not (
-                    isinstance(
-                        actual["sha256"],
-                        str,
-                    )
-                    and HEX64.fullmatch(
-                        actual["sha256"]
-                    )
-                    is not None
-                ):
-                    inventory_valid = False
-                    break
-
-                # Lowercase SHA-256 is mandatory.
-                if actual["sha256"] != actual["sha256"].lower():
-                    inventory_valid = False
+                    inventory_ok = False
                     break
 
                 # Exact values.
-                if actual["name"] != expected["name"]:
-                    inventory_valid = False
+                if (
+                    actual.get("name")
+                    != expected["name"]
+                ):
+                    inventory_ok = False
                     break
 
-                if actual["bytes"] != expected["bytes"]:
-                    inventory_valid = False
+                if (
+                    actual.get("bytes")
+                    != expected["bytes"]
+                ):
+                    inventory_ok = False
                     break
 
-                if actual["sha256"] != expected["sha256"]:
-                    inventory_valid = False
+                actual_hash = actual.get(
+                    "sha256"
+                )
+
+                if not (
+                    isinstance(
+                        actual_hash,
+                        str,
+                    )
+                    and HEX64.fullmatch(
+                        actual_hash
+                    )
+                    is not None
+                    and actual_hash
+                    == actual_hash.lower()
+                ):
+                    inventory_ok = False
                     break
 
-        if not inventory_valid:
-            unique_violation(
+                if (
+                    actual_hash
+                    != expected["sha256"]
+                ):
+                    inventory_ok = False
+                    break
+
+        if not inventory_ok:
+            add_violation(
                 violations,
                 "INVENTORY_MISMATCH",
             )
 
-    elif "INVALID_JSON:inventory.json" not in violations:
-
-        unique_violation(
+    elif (
+        "INVALID_JSON:inventory.json"
+        not in violations
+    ):
+        add_violation(
             violations,
             "INVENTORY_MISMATCH",
         )
 
-    # ============================================================
+    # ==========================================================
     # ADAPTER CONFIG
-    # ============================================================
+    # ==========================================================
 
-    adapter_config = parse_json_file(
+    config = parse_json_file(
         files,
         "adapter_config.json",
         violations,
     )
 
-    if isinstance(adapter_config, dict):
+    if isinstance(config, dict):
 
-        target_modules = adapter_config.get(
+        target_modules = config.get(
             "target_modules"
         )
 
         valid_config = (
-            is_safe_integer(
-                adapter_config.get("r")
+            safe_integer(
+                config.get("r")
             )
             and isinstance(
                 target_modules,
@@ -443,7 +465,7 @@ async def verify_bundle(request: Request):
             )
             and len(target_modules) > 0
             and all(
-                is_nonempty_string(x)
+                nonempty_string(x)
                 for x in target_modules
             )
             and len(target_modules)
@@ -451,21 +473,23 @@ async def verify_bundle(request: Request):
         )
 
         if not valid_config:
-            unique_violation(
+            add_violation(
                 violations,
                 "INVALID_ADAPTER_CONFIG",
             )
 
-    elif "INVALID_JSON:adapter_config.json" not in violations:
-
-        unique_violation(
+    elif (
+        "INVALID_JSON:adapter_config.json"
+        not in violations
+    ):
+        add_violation(
             violations,
             "INVALID_ADAPTER_CONFIG",
         )
 
-    # ============================================================
+    # ==========================================================
     # TRAINING MANIFEST
-    # ============================================================
+    # ==========================================================
 
     manifest = parse_json_file(
         files,
@@ -489,11 +513,11 @@ async def verify_bundle(request: Request):
 
             if (
                 field not in manifest
-                or not is_nonempty_string(
+                or not nonempty_string(
                     manifest[field]
                 )
             ):
-                unique_violation(
+                add_violation(
                     violations,
                     f"MISSING_MANIFEST_FIELD:{field}",
                 )
@@ -503,26 +527,31 @@ async def verify_bundle(request: Request):
         )
 
         if not (
-            isinstance(base_revision, str)
+            isinstance(
+                base_revision,
+                str,
+            )
             and HEX40.fullmatch(
                 base_revision
             ) is not None
         ):
-            unique_violation(
+            add_violation(
                 violations,
                 "MUTABLE_BASE_REVISION",
             )
 
-    elif "INVALID_JSON:training_manifest.json" not in violations:
-
-        unique_violation(
+    elif (
+        "INVALID_JSON:training_manifest.json"
+        not in violations
+    ):
+        add_violation(
             violations,
             "INVALID_TRAINING_MANIFEST",
         )
 
-    # ============================================================
-    # ARTIFACT DIGESTS
-    # ============================================================
+    # ==========================================================
+    # EXACT ARTIFACT HASHES
+    # ==========================================================
 
     model_digest = None
     evaluation_digest = None
@@ -538,52 +567,50 @@ async def verify_bundle(request: Request):
     if "evaluation.json" in raw_bytes:
 
         evaluation_digest = sha256_bytes(
-            raw_bytes["evaluation.json"]
+            raw_bytes[
+                "evaluation.json"
+            ]
         )
 
-    # Manifest -> model artifact.
+    # Manifest modelArtifactDigest.
     if (
         isinstance(manifest, dict)
         and model_digest is not None
-        and is_nonempty_string(
+        and nonempty_string(
             manifest.get(
                 "modelArtifactDigest"
             )
         )
+        and manifest[
+            "modelArtifactDigest"
+        ] != model_digest
     ):
+        add_violation(
+            violations,
+            "MODEL_ARTIFACT_MISMATCH",
+        )
 
-        if (
-            manifest["modelArtifactDigest"]
-            != model_digest
-        ):
-            unique_violation(
-                violations,
-                "MODEL_ARTIFACT_MISMATCH",
-            )
-
-    # Manifest -> exact evaluation.json bytes.
+    # Manifest evaluationArtifactDigest.
     if (
         isinstance(manifest, dict)
         and evaluation_digest is not None
-        and is_nonempty_string(
+        and nonempty_string(
             manifest.get(
                 "evaluationArtifactDigest"
             )
         )
+        and manifest[
+            "evaluationArtifactDigest"
+        ] != evaluation_digest
     ):
+        add_violation(
+            violations,
+            "EVALUATION_DIGEST_MISMATCH",
+        )
 
-        if (
-            manifest["evaluationArtifactDigest"]
-            != evaluation_digest
-        ):
-            unique_violation(
-                violations,
-                "EVALUATION_DIGEST_MISMATCH",
-            )
-
-    # ============================================================
-    # EVALUATION
-    # ============================================================
+    # ==========================================================
+    # EVALUATION BINDING
+    # ==========================================================
 
     evaluation = parse_json_file(
         files,
@@ -593,24 +620,28 @@ async def verify_bundle(request: Request):
 
     if isinstance(evaluation, dict):
 
-        # Evaluation must bind to exact model bytes.
-        if (
-            model_digest is not None
-            and evaluation.get(
+        evaluation_model_digest = (
+            evaluation.get(
                 "modelArtifactDigest"
             )
+        )
+
+        if (
+            model_digest is not None
+            and evaluation_model_digest
             != model_digest
         ):
-            unique_violation(
+            add_violation(
                 violations,
                 "EVALUATION_ARTIFACT_MISMATCH",
             )
 
-        # Aggregate.
-        if not is_unit_number(
-            evaluation.get("aggregate")
-        ):
-            unique_violation(
+        aggregate = evaluation.get(
+            "aggregate"
+        )
+
+        if not finite_unit(aggregate):
+            add_violation(
                 violations,
                 "INVALID_AGGREGATE",
             )
@@ -620,12 +651,18 @@ async def verify_bundle(request: Request):
             [],
         )
 
-        slices = evaluation.get("slices")
+        slices = evaluation.get(
+            "slices"
+        )
 
-        if not isinstance(slices, dict):
+        if not isinstance(
+            slices,
+            dict,
+        ):
 
             for slice_name in required_slices:
-                unique_violation(
+
+                add_violation(
                     violations,
                     f"MISSING_SLICE:{slice_name}",
                 )
@@ -636,30 +673,32 @@ async def verify_bundle(request: Request):
 
                 if slice_name not in slices:
 
-                    unique_violation(
+                    add_violation(
                         violations,
                         f"MISSING_SLICE:{slice_name}",
                     )
 
-                elif not is_unit_number(
+                elif not finite_unit(
                     slices[slice_name]
                 ):
 
-                    unique_violation(
+                    add_violation(
                         violations,
                         f"SLICE_RANGE:{slice_name}",
                     )
 
-    elif "INVALID_JSON:evaluation.json" not in violations:
-
-        unique_violation(
+    elif (
+        "INVALID_JSON:evaluation.json"
+        not in violations
+    ):
+        add_violation(
             violations,
             "INVALID_EVALUATION",
         )
 
-    # ============================================================
+    # ==========================================================
     # MODEL CARD
-    # ============================================================
+    # ==========================================================
 
     if isinstance(
         files.get("README.md"),
@@ -669,30 +708,33 @@ async def verify_bundle(request: Request):
             files["README.md"]
         )
     else:
-        card_status, card = "missing", None
+        card_status, card = (
+            "missing",
+            None,
+        )
 
     if card_status == "missing":
 
-        unique_violation(
+        add_violation(
             violations,
             "MODEL_CARD_COUNT",
         )
 
-        unique_violation(
+        add_violation(
             violations,
             "MISSING_MODEL_CARD",
         )
 
     elif card_status == "count":
 
-        unique_violation(
+        add_violation(
             violations,
             "MODEL_CARD_COUNT",
         )
 
     elif card_status == "invalid":
 
-        unique_violation(
+        add_violation(
             violations,
             "INVALID_MODEL_CARD",
         )
@@ -702,44 +744,72 @@ async def verify_bundle(request: Request):
         expected_card = {
             "task": (
                 manifest.get("task")
-                if isinstance(manifest, dict)
+                if isinstance(
+                    manifest,
+                    dict,
+                )
                 else None
             ),
             "baseRevision": (
-                manifest.get("baseRevision")
-                if isinstance(manifest, dict)
+                manifest.get(
+                    "baseRevision"
+                )
+                if isinstance(
+                    manifest,
+                    dict,
+                )
                 else None
             ),
             "datasetDigest": (
-                manifest.get("datasetDigest")
-                if isinstance(manifest, dict)
+                manifest.get(
+                    "datasetDigest"
+                )
+                if isinstance(
+                    manifest,
+                    dict,
+                )
                 else None
             ),
             "modelArtifactDigest": (
                 manifest.get(
                     "modelArtifactDigest"
                 )
-                if isinstance(manifest, dict)
+                if isinstance(
+                    manifest,
+                    dict,
+                )
                 else None
             ),
-            "license": policy.get("license"),
-            "intendedUse": policy.get("intendedUse"),
-            "limitations": policy.get("limitations"),
+            "license": policy.get(
+                "license"
+            ),
+            "intendedUse": policy.get(
+                "intendedUse"
+            ),
+            "limitations": policy.get(
+                "limitations"
+            ),
         }
 
-        for field, expected_value in expected_card.items():
+        mismatch = False
 
-            if card.get(field) != expected_value:
+        for field, expected in (
+            expected_card.items()
+        ):
 
-                unique_violation(
-                    violations,
-                    "MODEL_CARD_MISMATCH",
-                )
+            if card.get(field) != expected:
+                mismatch = True
                 break
 
-    # ============================================================
-    # FINAL DETERMINISTIC SERIALIZATION
-    # ============================================================
+        if mismatch:
+            add_violation(
+                violations,
+                "MODEL_CARD_MISMATCH",
+            )
+
+    # ==========================================================
+    # FINAL DETERMINISTIC RESULT
+    # ==========================================================
 
     violations = sorted(
         set(violations),
